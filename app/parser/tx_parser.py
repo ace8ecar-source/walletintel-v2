@@ -1,15 +1,14 @@
 """
 WalletIntel v2 — Transaction Parser
 
-The KEY innovation: parse swaps from preTokenBalances / postTokenBalances
+Parse swaps from preTokenBalances / postTokenBalances
 WITHOUT needing Helius Enhanced API.
 
-Logic:
-  1. For each transaction, compare pre and post token balances
-  2. For the target wallet: find tokens that increased and decreased
-  3. Increased = bought, Decreased = sold
-  4. Also track SOL balance changes (preBalances/postBalances)
-  5. Determine: token, amount, price in SOL, direction (BUY/SELL)
+v2.1 improvements:
+- Proper WSOL handling (no double-counting with SOL)
+- Classify non-swap tx (transfers, account mgmt) 
+- Better dust filtering
+- Handle token account creation in same tx
 """
 import logging
 from dataclasses import dataclass, field
@@ -59,6 +58,7 @@ class ParseResult:
     swaps: List[SwapEvent] = field(default_factory=list)
     transfers_in: int = 0
     transfers_out: int = 0
+    account_mgmt: int = 0  # ATA creation, close, approve, etc.
     unknown_tx: int = 0
     total_parsed: int = 0
     total_skipped: int = 0
@@ -69,9 +69,12 @@ class TransactionParser:
     Parse raw Solana transactions into SwapEvents.
 
     Uses the balance-diff approach:
-    - preTokenBalances + postTokenBalances → token changes
-    - preBalances + postBalances → SOL changes
+    - preTokenBalances + postTokenBalances -> token changes
+    - preBalances + postBalances -> SOL changes
     - Determine BUY/SELL based on what went in/out
+    
+    Key: WSOL in token balances takes priority over raw SOL change
+    to avoid double-counting when DEXes wrap/unwrap SOL.
     """
 
     def __init__(self, settings: Optional[Settings] = None):
@@ -85,9 +88,7 @@ class TransactionParser:
         wallet: str,
         transactions: List[Dict],
     ) -> ParseResult:
-        """
-        Parse all transactions for a wallet into swap events.
-        """
+        """Parse all transactions for a wallet into swap events."""
         result = ParseResult(wallet=wallet)
 
         for tx_data in transactions:
@@ -97,7 +98,16 @@ class TransactionParser:
                     result.swaps.append(swap)
                     result.total_parsed += 1
                 else:
-                    result.unknown_tx += 1
+                    # Classify the non-swap transaction
+                    tx_type = self._classify_non_swap(wallet, tx_data)
+                    if tx_type == "transfer_in":
+                        result.transfers_in += 1
+                    elif tx_type == "transfer_out":
+                        result.transfers_out += 1
+                    elif tx_type == "account_mgmt":
+                        result.account_mgmt += 1
+                    else:
+                        result.unknown_tx += 1
                     result.total_parsed += 1
             except Exception as e:
                 logger.debug(
@@ -110,6 +120,8 @@ class TransactionParser:
 
         logger.info(
             f"Parsed {wallet[:8]}...: {len(result.swaps)} swaps, "
+            f"{result.transfers_in} transfers_in, {result.transfers_out} transfers_out, "
+            f"{result.account_mgmt} account_mgmt, "
             f"{result.unknown_tx} unknown, {result.total_skipped} skipped"
         )
 
@@ -122,14 +134,12 @@ class TransactionParser:
     ) -> Optional[SwapEvent]:
         """
         Parse one transaction into a SwapEvent if it's a swap.
-
-        Returns None if transaction is not a swap (transfer, stake, etc).
+        Returns None if transaction is not a swap.
         """
         meta = tx_data.get("meta", {})
         if not meta:
             return None
 
-        # Check for error
         if meta.get("err") is not None:
             return None
 
@@ -140,22 +150,17 @@ class TransactionParser:
         # --- Get token balance changes for our wallet ---
         token_changes = self._get_token_changes(wallet, meta, tx_data)
 
+        # --- Check if WSOL is in token changes ---
+        has_wsol_change = any(tc.mint == self._wsol for tc in token_changes)
+
         # --- Get SOL balance change ---
         sol_change = self._get_sol_change(wallet, meta, tx_data)
         fee_lamports = meta.get("fee", 0)
         fee_sol = fee_lamports / 1e9
 
-        # --- Determine if this is a swap ---
-        # A swap has:
-        #   - One token increases (or SOL increases)
-        #   - Another token decreases (or SOL decreases)
-
-        if not token_changes and sol_change == 0:
-            return None
-
-        # Separate increases and decreases
-        received = []  # tokens that increased
-        sent = []  # tokens that decreased
+        # --- Build list of received/sent ---
+        received = []
+        sent = []
 
         for tc in token_changes:
             if tc.delta > 0:
@@ -163,35 +168,82 @@ class TransactionParser:
             elif tc.delta < 0:
                 sent.append(tc)
 
-        # Include SOL if it changed significantly (beyond fee)
-        # sol_change already has fee removed
-        sol_net = sol_change + fee_sol  # add fee back to see real movement
-        if abs(sol_net) > 0.001:  # more than dust
-            sol_tc = TokenChange(
-                mint=self._wsol,
-                owner=wallet,
-                pre_amount=0,
-                post_amount=0,
-                delta=sol_net,
-                decimals=9,
-            )
-            if sol_net > 0:
-                received.append(sol_tc)
-            else:
-                sent.append(sol_tc)
+        # Include SOL change ONLY if WSOL is NOT already in token changes
+        # This prevents double-counting when DEXes wrap/unwrap SOL
+        if not has_wsol_change:
+            sol_net = sol_change + fee_sol  # add fee back to see real movement
+            if abs(sol_net) > 0.001:  # more than dust
+                sol_tc = TokenChange(
+                    mint=self._wsol,
+                    owner=wallet,
+                    pre_amount=0,
+                    post_amount=0,
+                    delta=sol_net,
+                    decimals=9,
+                )
+                if sol_net > 0:
+                    received.append(sol_tc)
+                else:
+                    sent.append(sol_tc)
 
-        # --- Classify the swap ---
+        # --- Need both sides for a swap ---
         if not received or not sent:
-            # Not a swap — just transfer in/out
             return None
 
-        # Find the "base" (SOL or stablecoin) and "token" (everything else)
+        # --- Classify the swap ---
         swap = self._classify_swap(
             signature, block_time, slot,
             received, sent, fee_sol, tx_data,
         )
 
         return swap
+
+    def _classify_non_swap(self, wallet: str, tx_data: Dict) -> str:
+        """
+        Classify a non-swap transaction.
+        Returns: 'transfer_in', 'transfer_out', 'account_mgmt', or 'unknown'
+        """
+        meta = tx_data.get("meta", {})
+        if not meta:
+            return "unknown"
+
+        sol_change = self._get_sol_change(wallet, meta, tx_data)
+        fee_lamports = meta.get("fee", 0)
+        fee_sol = fee_lamports / 1e9
+        token_changes = self._get_token_changes(wallet, meta, tx_data)
+
+        # Check log messages for account management
+        log_messages = meta.get("logMessages", [])
+        for log in log_messages:
+            if isinstance(log, str):
+                if "InitializeAccount" in log or "CreateAccount" in log:
+                    return "account_mgmt"
+                if "CloseAccount" in log:
+                    return "account_mgmt"
+                if "Approve" in log or "Revoke" in log:
+                    return "account_mgmt"
+
+        # Pure SOL transfer (no token changes)
+        if not token_changes:
+            sol_net = sol_change + fee_sol
+            if sol_net > 0.001:
+                return "transfer_in"
+            elif sol_net < -0.001:
+                return "transfer_out"
+            # Small SOL change = likely just fee for account mgmt
+            if abs(sol_change) > 0 and abs(sol_change + fee_sol) < 0.001:
+                return "account_mgmt"
+
+        # Token transfer (one direction only, no swap)
+        if token_changes:
+            has_increase = any(tc.delta > 0 for tc in token_changes)
+            has_decrease = any(tc.delta < 0 for tc in token_changes)
+            if has_increase and not has_decrease:
+                return "transfer_in"
+            if has_decrease and not has_increase:
+                return "transfer_out"
+
+        return "unknown"
 
     def _get_token_changes(
         self,
@@ -202,56 +254,71 @@ class TransactionParser:
         """
         Compute token balance diffs from preTokenBalances/postTokenBalances.
         Only returns changes for the target wallet.
+        
+        Handles edge cases:
+        - Token account created in same tx (only in post, not in pre)
+        - Token account closed in same tx (only in pre, not in post)
+        - Match by mint+owner when accountIndex differs
         """
         pre_balances = meta.get("preTokenBalances", [])
         post_balances = meta.get("postTokenBalances", [])
 
-        # Build lookup: (accountIndex, mint) → balance
-        pre_map = {}
+        # Build lookup by mint (more reliable than accountIndex for our wallet)
+        # because accountIndex can differ between pre and post when accounts are created
+        pre_by_mint = {}
         for b in pre_balances:
             owner = b.get("owner", "")
             if owner == wallet:
-                key = (b.get("accountIndex"), b.get("mint"))
+                mint = b.get("mint", "")
+                if not mint:
+                    continue
                 amount_str = b.get("uiTokenAmount", {}).get("uiAmountString", "0")
+                decimals = b.get("uiTokenAmount", {}).get("decimals", 0)
                 try:
-                    pre_map[key] = (
-                        float(amount_str) if amount_str else 0.0,
-                        b.get("uiTokenAmount", {}).get("decimals", 0),
-                        b.get("mint", ""),
-                    )
+                    amount = float(amount_str) if amount_str else 0.0
                 except (ValueError, TypeError):
-                    pass
+                    amount = 0.0
+                # If multiple accounts for same mint, sum them
+                if mint in pre_by_mint:
+                    pre_by_mint[mint] = (
+                        pre_by_mint[mint][0] + amount,
+                        decimals,
+                    )
+                else:
+                    pre_by_mint[mint] = (amount, decimals)
 
-        post_map = {}
+        post_by_mint = {}
         for b in post_balances:
             owner = b.get("owner", "")
             if owner == wallet:
-                key = (b.get("accountIndex"), b.get("mint"))
+                mint = b.get("mint", "")
+                if not mint:
+                    continue
                 amount_str = b.get("uiTokenAmount", {}).get("uiAmountString", "0")
+                decimals = b.get("uiTokenAmount", {}).get("decimals", 0)
                 try:
-                    post_map[key] = (
-                        float(amount_str) if amount_str else 0.0,
-                        b.get("uiTokenAmount", {}).get("decimals", 0),
-                        b.get("mint", ""),
-                    )
+                    amount = float(amount_str) if amount_str else 0.0
                 except (ValueError, TypeError):
-                    pass
+                    amount = 0.0
+                if mint in post_by_mint:
+                    post_by_mint[mint] = (
+                        post_by_mint[mint][0] + amount,
+                        decimals,
+                    )
+                else:
+                    post_by_mint[mint] = (amount, decimals)
 
-        # Merge keys
-        all_keys = set(pre_map.keys()) | set(post_map.keys())
+        # Merge all mints
+        all_mints = set(pre_by_mint.keys()) | set(post_by_mint.keys())
         changes = []
 
-        for key in all_keys:
-            pre_amount, decimals, mint = pre_map.get(key, (0.0, 0, ""))
-            post_amount, dec2, mint2 = post_map.get(key, (0.0, 0, ""))
-            mint = mint or mint2
-            decimals = decimals or dec2
-
-            if not mint:
-                continue
+        for mint in all_mints:
+            pre_amount, pre_dec = pre_by_mint.get(mint, (0.0, 0))
+            post_amount, post_dec = post_by_mint.get(mint, (0.0, 0))
+            decimals = pre_dec or post_dec
 
             delta = post_amount - pre_amount
-            if abs(delta) < 1e-12:  # dust
+            if abs(delta) < 1e-12:
                 continue
 
             changes.append(TokenChange(
@@ -277,7 +344,6 @@ class TransactionParser:
         pre_balances = meta.get("preBalances", [])
         post_balances = meta.get("postBalances", [])
 
-        # Find wallet index in accountKeys
         account_keys = self._get_account_keys(tx_data)
         wallet_idx = None
 
@@ -297,7 +363,7 @@ class TransactionParser:
         pre_lamports = pre_balances[wallet_idx]
         post_lamports = post_balances[wallet_idx] if wallet_idx < len(post_balances) else pre_lamports
 
-        return (post_lamports - pre_lamports) / 1e9  # lamports → SOL
+        return (post_lamports - pre_lamports) / 1e9
 
     def _get_account_keys(self, tx_data: Dict) -> List:
         """Extract account keys from transaction."""
@@ -317,12 +383,6 @@ class TransactionParser:
     ) -> Optional[SwapEvent]:
         """
         Classify a swap: determine BUY/SELL, base/token, price.
-
-        Logic:
-        - If SOL/stable was sent and token received → BUY
-        - If token was sent and SOL/stable received → SELL
-        - Base = SOL or stablecoin
-        - Token = everything else
         """
         # Identify base and token in received
         base_received = None
@@ -347,7 +407,7 @@ class TransactionParser:
 
         # --- BUY: sent base, received token ---
         if base_sent and token_received:
-            token = token_received[0]  # primary token
+            token = token_received[0]
             base_amount = abs(base_sent.delta)
             token_amount = abs(token.delta)
             price = base_amount / token_amount if token_amount > 0 else 0
@@ -391,8 +451,6 @@ class TransactionParser:
 
         # --- Token-to-token swap (no SOL/stable) ---
         if token_sent and token_received and not base_sent and not base_received:
-            # Treat the sent token as "sold" and received as "bought"
-            # Can't determine price in SOL without additional data
             token_in = token_received[0]
             token_out = token_sent[0]
 
@@ -403,7 +461,7 @@ class TransactionParser:
                 direction="BUY",
                 token_mint=token_in.mint,
                 token_amount=abs(token_in.delta),
-                sol_amount=0,  # unknown SOL equivalent
+                sol_amount=0,
                 price_sol=0,
                 base_mint=token_out.mint,
                 base_symbol="TOKEN",
@@ -422,7 +480,7 @@ class TransactionParser:
         if mint == self._wsol:
             return "SOL"
         if mint in self._stables:
-            return self._stables[mint][0]  # "USDC" or "USDT"
+            return self._stables[mint][0]
         return "UNKNOWN"
 
     def _detect_dex(self, tx_data: Dict) -> str:
