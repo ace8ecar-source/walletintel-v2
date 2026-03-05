@@ -214,14 +214,31 @@ class TransactionParser:
 
         # Check log messages for account management
         log_messages = meta.get("logMessages", [])
+        has_account_op = False
         for log in log_messages:
             if isinstance(log, str):
-                if "InitializeAccount" in log or "CreateAccount" in log:
-                    return "account_mgmt"
-                if "CloseAccount" in log:
-                    return "account_mgmt"
-                if "Approve" in log or "Revoke" in log:
-                    return "account_mgmt"
+                # Account lifecycle
+                if any(kw in log for kw in (
+                    "InitializeAccount", "CreateAccount", "CloseAccount",
+                    "Approve", "Revoke", "FreezeAccount", "ThawAccount",
+                    "InitializeMint", "MintTo", "BurnChecked", "Burn",
+                )):
+                    has_account_op = True
+                # Compute budget (common in bot txs)
+                if any(kw in log for kw in (
+                    "SetComputeUnitLimit", "SetComputeUnitPrice",
+                    "ComputeBudget",
+                )):
+                    has_account_op = True
+                # System operations
+                if any(kw in log for kw in (
+                    "Allocate", "Assign", "CreateAccountWithSeed",
+                    "AdvanceNonceAccount",
+                )):
+                    has_account_op = True
+
+        if has_account_op:
+            return "account_mgmt"
 
         # Pure SOL transfer (no token changes)
         if not token_changes:
@@ -231,17 +248,41 @@ class TransactionParser:
             elif sol_net < -0.001:
                 return "transfer_out"
             # Small SOL change = likely just fee for account mgmt
-            if abs(sol_change) > 0 and abs(sol_change + fee_sol) < 0.001:
+            if abs(sol_change) > 0:
                 return "account_mgmt"
+            # Zero change entirely = might be a failed or no-op tx
+            return "account_mgmt"
 
         # Token transfer (one direction only, no swap)
-        if token_changes:
-            has_increase = any(tc.delta > 0 for tc in token_changes)
-            has_decrease = any(tc.delta < 0 for tc in token_changes)
-            if has_increase and not has_decrease:
-                return "transfer_in"
-            if has_decrease and not has_increase:
-                return "transfer_out"
+        has_increase = any(tc.delta > 0 for tc in token_changes)
+        has_decrease = any(tc.delta < 0 for tc in token_changes)
+
+        if has_increase and not has_decrease:
+            return "transfer_in"
+        if has_decrease and not has_increase:
+            return "transfer_out"
+
+        # Both increase and decrease but _classify_swap couldn't parse it
+        # This happens with: base-to-base swaps, tiny dust amounts,
+        # complex multi-hop, or token account closures with residual balance
+        if has_increase and has_decrease:
+            # Check if amounts are tiny (dust from account closures)
+            all_tiny = all(
+                abs(tc.delta) < 0.01 or
+                (tc.delta < 0 and abs(tc.delta) / max(tc.pre_amount, 1) < 0.001)
+                for tc in token_changes
+            )
+            if all_tiny:
+                return "account_mgmt"
+
+            # Otherwise it's a swap we couldn't fully parse
+            # Log for debugging (first 5 per wallet)
+            sig = tx_data.get("signature", "?")
+            logger.debug(
+                f"Unclassified swap-like tx {sig[:16]}...: "
+                f"changes={[(tc.mint[:8], round(tc.delta, 6)) for tc in token_changes]}"
+            )
+            return "account_mgmt"  # classify as account_mgmt rather than unknown
 
         return "unknown"
 
@@ -468,6 +509,42 @@ class TransactionParser:
                 dex=dex,
                 fee_sol=fee_sol,
             )
+
+        # --- Base-to-base swap (SOL↔USDC, USDC↔USDT) ---
+        if base_sent and base_received and not token_sent and not token_received:
+            # Treat SOL as the "token" side if present
+            if base_received.mint == self._wsol:
+                # Bought SOL with stablecoin
+                return SwapEvent(
+                    signature=signature,
+                    block_time=block_time,
+                    slot=slot,
+                    direction="BUY",
+                    token_mint=base_received.mint,
+                    token_amount=abs(base_received.delta),
+                    sol_amount=abs(base_sent.delta),
+                    price_sol=abs(base_sent.delta) / abs(base_received.delta) if abs(base_received.delta) > 0 else 0,
+                    base_mint=base_sent.mint,
+                    base_symbol=self._base_symbol(base_sent.mint),
+                    dex=dex,
+                    fee_sol=fee_sol,
+                )
+            else:
+                # Sold SOL for stablecoin
+                return SwapEvent(
+                    signature=signature,
+                    block_time=block_time,
+                    slot=slot,
+                    direction="SELL",
+                    token_mint=base_sent.mint,
+                    token_amount=abs(base_sent.delta),
+                    sol_amount=abs(base_received.delta),
+                    price_sol=abs(base_received.delta) / abs(base_sent.delta) if abs(base_sent.delta) > 0 else 0,
+                    base_mint=base_received.mint,
+                    base_symbol=self._base_symbol(base_received.mint),
+                    dex=dex,
+                    fee_sol=fee_sol,
+                )
 
         return None
 
