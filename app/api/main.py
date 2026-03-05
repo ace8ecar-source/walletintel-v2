@@ -2,22 +2,25 @@
 WalletIntel v2 — FastAPI Application
 
 Endpoints:
-  GET  /                     → Service info
-  GET  /health               → Health check
-  GET  /wallet/{address}/pnl → Full wallet analytics
-  GET  /wallet/{address}/summary → Quick summary only
-  GET  /stats                → Pool and cache stats
+  GET  /                          → Landing page / service info
+  GET  /health                    → Health check
+  GET  /wallet/{address}/pnl      → Full wallet analytics
+  GET  /wallet/{address}/summary  → Quick summary only
+  GET  /leaderboard               → Top scanned wallets
+  GET  /stats                     → Pool, cache and usage stats
 """
 import logging
 import time
 import re
+import hashlib
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from pathlib import Path
 
 from app.config import load_settings, load_rpc_providers
 from app.rpc.pool import RPCPool
@@ -25,6 +28,7 @@ from app.rpc.fetcher import TransactionFetcher
 from app.parser.tx_parser import TransactionParser
 from app.parser.token_resolver import TokenResolver
 from app.analytics.engine import AnalyticsEngine
+from app.analytics.collector import AnalyticsCollector
 from app.cache.memory import WalletCache
 
 logger = logging.getLogger(__name__)
@@ -37,17 +41,23 @@ parser: Optional[TransactionParser] = None
 analytics: Optional[AnalyticsEngine] = None
 cache: Optional[WalletCache] = None
 token_resolver: Optional[TokenResolver] = None
+collector: Optional[AnalyticsCollector] = None
 
-# Simple rate limiter: IP → list of timestamps
+# Simple rate limiter: IP -> list of timestamps
 _rate_limits: dict = defaultdict(list)
 FREE_DAILY_LIMIT = 10
 RATE_WINDOW = 86400  # 24 hours
 
 
+def _hash_ip(ip: str) -> str:
+    """Hash IP for privacy — we store hash, not raw IP."""
+    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
-    global rpc_pool, fetcher, parser, analytics, cache, token_resolver
+    global rpc_pool, fetcher, parser, analytics, cache, token_resolver, collector
 
     # Setup logging
     logging.basicConfig(
@@ -65,6 +75,7 @@ async def lifespan(app: FastAPI):
     analytics = AnalyticsEngine()
     token_resolver = TokenResolver()
     await token_resolver.start()
+    collector = AnalyticsCollector()
     cache = WalletCache(
         ttl_hours=settings.cache_ttl_hours,
         max_entries=settings.cache_max_wallets,
@@ -119,7 +130,6 @@ def check_rate_limit(request: Request):
     ip = request.client.host if request.client else "unknown"
     api_key = request.headers.get("X-API-Key", "")
 
-    # API key holders skip rate limit (for future paid tiers)
     if api_key:
         return
 
@@ -134,7 +144,7 @@ def check_rate_limit(request: Request):
                 "error": "Daily limit reached",
                 "limit": FREE_DAILY_LIMIT,
                 "resets_in_seconds": int(RATE_WINDOW - (now - _rate_limits[ip][0])),
-                "tip": "Free tier: 10 requests/day. Donate SOL to support the project!",
+                "tip": "Free tier: 10 requests/day. We are working on increasing this limit.",
             }
         )
 
@@ -143,22 +153,37 @@ def check_rate_limit(request: Request):
 
 # ===== Endpoints =====
 
-@app.get("/")
-async def root():
-    return {
+STATIC_DIR = Path(__file__).parent.parent.parent / "static"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root(request: Request):
+    """Serve landing page for browsers, JSON for API clients."""
+    # Log visit
+    if collector:
+        ip = request.client.host if request.client else "unknown"
+        collector.log_request(_hash_ip(ip), "/")
+
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        index = STATIC_DIR / "index.html"
+        if index.exists():
+            return HTMLResponse(index.read_text())
+    return JSONResponse({
         "service": "WalletIntel v2",
         "version": "2.0.0",
         "description": "Free Solana Wallet PnL & Analytics API",
         "endpoints": {
             "wallet_pnl": "/wallet/{address}/pnl",
             "wallet_summary": "/wallet/{address}/summary",
+            "leaderboard": "/leaderboard",
             "health": "/health",
             "stats": "/stats",
         },
         "free_tier": f"{FREE_DAILY_LIMIT} requests/day",
-        "donate": "Support development: [SOL wallet address]",
         "docs": "/docs",
-    }
+        "website": "https://walletintel.dev",
+    })
 
 
 @app.get("/health")
@@ -186,6 +211,11 @@ async def wallet_pnl(
     """
     wallet = validate_wallet(address)
     check_rate_limit(request)
+
+    # Log request
+    if collector:
+        ip = request.client.host if request.client else "unknown"
+        collector.log_request(_hash_ip(ip), "/wallet/pnl", wallet)
 
     # Check cache
     if not force_refresh:
@@ -224,13 +254,27 @@ async def wallet_pnl(
             resolved = await token_resolver.resolve_batch(mints)
             for t in wallet_analytics.tokens:
                 if t.mint in resolved:
-                    t.symbol = resolved[t.mint][0]  # symbol
+                    t.symbol = resolved[t.mint][0]
 
     # 4. Cache result
     cache.put(wallet, wallet_analytics)
 
+    # 4.5. Log scan to analytics collector
+    total_time = round(time.time() - start, 2)
+    if collector:
+        collector.log_scan(
+            wallet=wallet,
+            score=wallet_analytics.score,
+            win_rate=wallet_analytics.win_rate,
+            pnl_sol=wallet_analytics.total_realized_pnl_sol,
+            strategy=wallet_analytics.strategy,
+            total_trades=wallet_analytics.total_trades,
+            unique_tokens=wallet_analytics.unique_tokens,
+            scan_time=total_time,
+        )
+
     # 5. Build response
-    response = cache.get(wallet)  # get serialized version
+    response = cache.get(wallet)
     response["_cached"] = False
     response["_scan_info"] = {
         "signatures_found": fetch_result["signatures_found"],
@@ -242,7 +286,7 @@ async def wallet_pnl(
         "unknown_tx": parse_result.unknown_tx,
         "skipped_tx": parse_result.total_skipped,
         "fetch_time": fetch_result["fetch_time_seconds"],
-        "total_time": round(time.time() - start, 2),
+        "total_time": total_time,
     }
 
     return response
@@ -260,11 +304,32 @@ async def wallet_summary(
     """
     full = await wallet_pnl(address, request, max_tx=max_tx)
 
-    # Strip token details for lighter response
     if isinstance(full, dict):
         full.pop("tokens", None)
 
     return full
+
+
+@app.get("/leaderboard")
+async def leaderboard(
+    sort: str = Query(default="score", description="Sort by: score, pnl, win_rate, trades, popular"),
+    limit: int = Query(default=20, ge=1, le=100),
+    min_trades: int = Query(default=5, ge=1),
+):
+    """
+    Top scanned wallets leaderboard.
+    Built from community scans — the more people scan, the better the data.
+    """
+    if not collector:
+        return {"wallets": [], "total": 0}
+
+    wallets = collector.get_top_wallets(sort_by=sort, limit=limit, min_trades=min_trades)
+    return {
+        "wallets": wallets,
+        "total": len(wallets),
+        "sort": sort,
+        "min_trades": min_trades,
+    }
 
 
 @app.get("/stats")
@@ -274,6 +339,7 @@ async def stats():
         "rpc_pool": rpc_pool.get_stats() if rpc_pool else {},
         "cache": cache.stats() if cache else {},
         "token_resolver": token_resolver.cache_stats() if token_resolver else {},
+        "usage": collector.get_usage_stats() if collector else {},
     }
 
 
