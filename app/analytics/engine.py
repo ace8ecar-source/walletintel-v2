@@ -87,6 +87,14 @@ class WalletAnalytics:
 class AnalyticsEngine:
     """Calculate PnL, WR, Strategy, and Score from swap events."""
 
+    # Base tokens to exclude from per-token breakdown
+    WSOL = "So11111111111111111111111111111111111111112"
+    BASE_MINTS = {
+        WSOL,
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    }
+
     def analyze(self, wallet: str, swaps: List[SwapEvent]) -> WalletAnalytics:
         """Run full analytics pipeline."""
         analytics = WalletAnalytics(wallet=wallet)
@@ -96,6 +104,13 @@ class AnalyticsEngine:
 
         # Step 1: Calculate per-token PnL
         token_pnls = self._calculate_token_pnl(swaps)
+
+        # Step 1.5: Remove base tokens (SOL, USDC, USDT) from per-token list
+        # These appear from base-to-base swaps and shouldn't be in breakdown
+        token_pnls = {
+            mint: tp for mint, tp in token_pnls.items()
+            if mint not in self.BASE_MINTS
+        }
 
         # Step 2: Aggregate wallet-level stats
         self._aggregate_stats(analytics, swaps, token_pnls)
