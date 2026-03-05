@@ -23,6 +23,7 @@ from app.config import load_settings, load_rpc_providers
 from app.rpc.pool import RPCPool
 from app.rpc.fetcher import TransactionFetcher
 from app.parser.tx_parser import TransactionParser
+from app.parser.token_resolver import TokenResolver
 from app.analytics.engine import AnalyticsEngine
 from app.cache.memory import WalletCache
 
@@ -35,6 +36,7 @@ fetcher: Optional[TransactionFetcher] = None
 parser: Optional[TransactionParser] = None
 analytics: Optional[AnalyticsEngine] = None
 cache: Optional[WalletCache] = None
+token_resolver: Optional[TokenResolver] = None
 
 # Simple rate limiter: IP → list of timestamps
 _rate_limits: dict = defaultdict(list)
@@ -45,7 +47,7 @@ RATE_WINDOW = 86400  # 24 hours
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
-    global rpc_pool, fetcher, parser, analytics, cache
+    global rpc_pool, fetcher, parser, analytics, cache, token_resolver
 
     # Setup logging
     logging.basicConfig(
@@ -61,6 +63,8 @@ async def lifespan(app: FastAPI):
     fetcher = TransactionFetcher(rpc_pool, max_signatures=settings.max_signatures)
     parser = TransactionParser(settings)
     analytics = AnalyticsEngine()
+    token_resolver = TokenResolver()
+    await token_resolver.start()
     cache = WalletCache(
         ttl_hours=settings.cache_ttl_hours,
         max_entries=settings.cache_max_wallets,
@@ -75,6 +79,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    if token_resolver:
+        await token_resolver.stop()
     if rpc_pool:
         await rpc_pool.stop()
     logger.info("WalletIntel v2 stopped")
@@ -211,6 +217,15 @@ async def wallet_pnl(
     # 3. Calculate analytics
     wallet_analytics = analytics.analyze(wallet, parse_result.swaps)
 
+    # 3.5. Resolve token symbols
+    if token_resolver and wallet_analytics.tokens:
+        mints = [t.mint for t in wallet_analytics.tokens if not t.symbol]
+        if mints:
+            resolved = await token_resolver.resolve_batch(mints)
+            for t in wallet_analytics.tokens:
+                if t.mint in resolved:
+                    t.symbol = resolved[t.mint][0]  # symbol
+
     # 4. Cache result
     cache.put(wallet, wallet_analytics)
 
@@ -258,6 +273,7 @@ async def stats():
     return {
         "rpc_pool": rpc_pool.get_stats() if rpc_pool else {},
         "cache": cache.stats() if cache else {},
+        "token_resolver": token_resolver.cache_stats() if token_resolver else {},
     }
 
 
