@@ -29,3 +29,5 @@ Thumbs.db
 
 # Analytics data
 data/
+result.json
+test.json

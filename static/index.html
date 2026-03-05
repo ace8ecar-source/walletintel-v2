@@ -102,7 +102,7 @@ h1 .gradient { background: linear-gradient(135deg, var(--accent), var(--blue)); 
 .demo-url button { padding: 8px 20px; background: var(--accent); color: #000; border: none; border-radius: 6px; font-family: var(--mono); font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
 .demo-url button:hover { background: var(--accent2); }
 .demo-url button:disabled { opacity: 0.5; cursor: not-allowed; }
-.demo-body { padding: 20px; min-height: 300px; font-family: var(--mono); font-size: 13px; line-height: 1.6; color: var(--text2); overflow-x: auto; }
+.demo-body { padding: 20px; min-height: 300px; font-family: var(--mono); font-size: 13px; line-height: 1.6; color: var(--text2); overflow-x: auto; white-space: pre-wrap; }
 .demo-body .key { color: var(--blue); }
 .demo-body .str { color: var(--accent); }
 .demo-body .num { color: var(--yellow); }
@@ -260,7 +260,7 @@ footer a { color: var(--accent); text-decoration: none; }
         <button id="scan-btn" onclick="scanWallet()">Scan</button>
       </div>
     </div>
-    <div class="demo-body" id="demo-output">
+    <div class="demo-body" id="demo-output" style="white-space:pre">
       <div class="demo-placeholder">
         <div class="icon">&#128270;</div>
         <div>Enter a Solana wallet address and hit Scan</div>
@@ -413,20 +413,28 @@ async function scanWallet() {
     const pnl = data.total_realized_pnl_sol;
     const pnlColor = pnl >= 0 ? 'var(--accent)' : 'var(--red)';
     const pnlSign = pnl >= 0 ? '+' : '';
-    output.innerHTML = `
-<span class="key">"wallet"</span>: <span class="str">"${wallet.slice(0,8)}...${wallet.slice(-4)}"</span>
-<span class="key">"total_trades"</span>: <span class="num">${data.total_trades}</span>
-<span class="key">"win_rate"</span>: <span class="num">${data.win_rate}%</span>
-<span class="key">"total_realized_pnl_sol"</span>: <span style="color:${pnlColor};font-weight:700">${pnlSign}${pnl.toFixed(2)} SOL</span>
-<span class="key">"strategy"</span>: <span class="label">"${data.strategy}"</span>
-<span class="key">"score"</span>: <span class="num">${data.score}</span><span class="key">/100</span>
-<span class="key">"unique_tokens"</span>: <span class="num">${data.unique_tokens}</span>
-<span class="key">"dex_usage"</span>: <span class="str">${JSON.stringify(data.dex_usage)}</span>
-<span class="key">"active_days"</span>: <span class="num">${data.active_days}</span>
-<span style="color:var(--text2);font-size:11px">
-${data._cached ? '&#9889; Cached response (instant)' : `&#128270; Scanned ${data._scan_info?.transactions_fetched || '?'} transactions in ${data._scan_info?.total_time || '?'}s`}
-</span>
-<a href="${API}/wallet/${wallet}/pnl" target="_blank" style="color:var(--blue);font-size:12px;text-decoration:underline">&rarr; View full response with per-token breakdown</a>`;
+    const json = {
+      wallet: wallet.slice(0,8) + '...' + wallet.slice(-4),
+      total_trades: data.total_trades,
+      win_rate: data.win_rate,
+      total_realized_pnl_sol: parseFloat(pnl.toFixed(4)),
+      strategy: data.strategy,
+      score: data.score,
+      unique_tokens: data.unique_tokens,
+      dex_usage: data.dex_usage,
+      active_days: data.active_days,
+    };
+    const formatted = JSON.stringify(json, null, 2)
+      .replace(/"([^"]+)":/g, '<span class="key">"$1"</span>:')
+      .replace(/"(smart_money|sniper|scalper|diamond_hands|degen|mixed)"/g, '<span class="label">"$1"</span>')
+      .replace(/: "([^"]*)"/g, ': <span class="str">"$1"</span>')
+      .replace(/: (-?\d+\.?\d*)/g, ': <span class="num">$1</span>');
+    const info = data._cached
+      ? '\u26a1 Cached response (instant)'
+      : '\ud83d\udd0d Scanned ' + (data._scan_info?.transactions_fetched || '?') + ' transactions in ' + (data._scan_info?.total_time || '?') + 's';
+    output.innerHTML = formatted +
+      '\n\n<span style="color:var(--text2);font-size:11px">' + info + '</span>' +
+      '\n<a href="' + API + '/wallet/' + wallet + '/pnl" target="_blank" style="color:var(--blue);font-size:12px;text-decoration:underline">\u2192 View full response with per-token breakdown</a>';
   } catch (e) {
     output.innerHTML = `<div class="demo-placeholder"><div class="icon">&#10060;</div>Error: ${e.message}</div>`;
   } finally { btn.disabled = false; btn.textContent = 'Scan'; }
