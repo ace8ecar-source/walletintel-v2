@@ -42,7 +42,7 @@ class WalletCache:
         self._total_misses = 0
 
     def get(self, wallet: str) -> Optional[Dict]:
-        """Get cached analytics for a wallet. Returns None if miss or expired."""
+        """Get cached analytics for a wallet. Returns a copy (safe to mutate)."""
         key = self._key(wallet)
         entry = self._store.get(key)
 
@@ -57,7 +57,9 @@ class WalletCache:
 
         entry.hits += 1
         self._total_hits += 1
-        return entry.data
+        # Return deep copy to prevent callers from mutating cached data
+        import copy
+        return copy.deepcopy(entry.data)
 
     def put(self, wallet: str, analytics: WalletAnalytics):
         """Store analytics in cache."""

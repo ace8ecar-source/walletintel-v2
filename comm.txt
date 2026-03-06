@@ -1,0 +1,11 @@
+sudo journalctl -u walletintel -f
+
+
+
+нагрузки сервера:
+
+htop
+
+
+ ssh walletintel@164.92.180.163
+

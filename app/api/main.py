@@ -13,6 +13,7 @@ import logging
 import time
 import re
 import hashlib
+import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -48,6 +49,10 @@ _rate_limits: dict = defaultdict(list)
 FREE_DAILY_LIMIT = 10
 RATE_WINDOW = 86400  # 24 hours
 
+# Limit concurrent scans (heavy RPC operations)
+MAX_CONCURRENT_SCANS = 3
+_scan_semaphore: Optional[asyncio.Semaphore] = None
+
 
 def _hash_ip(ip: str) -> str:
     """Hash IP for privacy — we store hash, not raw IP."""
@@ -57,7 +62,7 @@ def _hash_ip(ip: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
-    global rpc_pool, fetcher, parser, analytics, cache, token_resolver, collector
+    global rpc_pool, fetcher, parser, analytics, cache, token_resolver, collector, _scan_semaphore
 
     # Setup logging
     logging.basicConfig(
@@ -76,6 +81,7 @@ async def lifespan(app: FastAPI):
     token_resolver = TokenResolver()
     await token_resolver.start()
     collector = AnalyticsCollector()
+    _scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
     cache = WalletCache(
         ttl_hours=settings.cache_ttl_hours,
         max_entries=settings.cache_max_wallets,
@@ -224,72 +230,90 @@ async def wallet_pnl(
             cached["_cached"] = True
             return cached
 
-    # Full scan
-    start = time.time()
+    # Full scan (limited concurrency to protect RPC)
+    if _scan_semaphore:
+        try:
+            await asyncio.wait_for(_scan_semaphore.acquire(), timeout=10)
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                503,
+                detail={
+                    "error": "Server busy — too many concurrent scans",
+                    "tip": "Please retry in a few seconds",
+                    "max_concurrent": MAX_CONCURRENT_SCANS,
+                }
+            )
 
-    # 1. Fetch transactions
-    fetch_result = await fetcher.fetch_wallet(wallet, max_tx=max_tx)
+    try:
+        start = time.time()
 
-    if fetch_result["transactions_fetched"] == 0:
-        return {
-            "wallet": wallet,
-            "error": None,
-            "total_trades": 0,
-            "message": "No transactions found or wallet is empty",
-            "fetch_time_seconds": fetch_result["fetch_time_seconds"],
-        }
+        # 1. Fetch transactions
+        fetch_result = await fetcher.fetch_wallet(wallet, max_tx=max_tx)
 
-    # 2. Parse swaps
-    parse_result = parser.parse_wallet_transactions(
-        wallet, fetch_result["transactions"]
-    )
+        if fetch_result["transactions_fetched"] == 0:
+            return {
+                "wallet": wallet,
+                "error": None,
+                "total_trades": 0,
+                "message": "No transactions found or wallet is empty",
+                "fetch_time_seconds": fetch_result["fetch_time_seconds"],
+            }
 
-    # 3. Calculate analytics
-    wallet_analytics = analytics.analyze(wallet, parse_result.swaps)
-
-    # 3.5. Resolve token symbols
-    if token_resolver and wallet_analytics.tokens:
-        mints = [t.mint for t in wallet_analytics.tokens if not t.symbol]
-        if mints:
-            resolved = await token_resolver.resolve_batch(mints)
-            for t in wallet_analytics.tokens:
-                if t.mint in resolved:
-                    t.symbol = resolved[t.mint][0]
-
-    # 4. Cache result
-    cache.put(wallet, wallet_analytics)
-
-    # 4.5. Log scan to analytics collector
-    total_time = round(time.time() - start, 2)
-    if collector:
-        collector.log_scan(
-            wallet=wallet,
-            score=wallet_analytics.score,
-            win_rate=wallet_analytics.win_rate,
-            pnl_sol=wallet_analytics.total_realized_pnl_sol,
-            strategy=wallet_analytics.strategy,
-            total_trades=wallet_analytics.total_trades,
-            unique_tokens=wallet_analytics.unique_tokens,
-            scan_time=total_time,
+        # 2. Parse swaps
+        parse_result = parser.parse_wallet_transactions(
+            wallet, fetch_result["transactions"]
         )
 
-    # 5. Build response
-    response = cache.get(wallet)
-    response["_cached"] = False
-    response["_scan_info"] = {
-        "signatures_found": fetch_result["signatures_found"],
-        "transactions_fetched": fetch_result["transactions_fetched"],
-        "swaps_detected": len(parse_result.swaps),
-        "transfers_in": parse_result.transfers_in,
-        "transfers_out": parse_result.transfers_out,
-        "account_mgmt": parse_result.account_mgmt,
-        "unknown_tx": parse_result.unknown_tx,
-        "skipped_tx": parse_result.total_skipped,
-        "fetch_time": fetch_result["fetch_time_seconds"],
-        "total_time": total_time,
-    }
+        # 3. Calculate analytics
+        wallet_analytics = analytics.analyze(wallet, parse_result.swaps)
 
-    return response
+        # 3.5. Resolve token symbols
+        if token_resolver and wallet_analytics.tokens:
+            mints = [t.mint for t in wallet_analytics.tokens if not t.symbol]
+            if mints:
+                resolved = await token_resolver.resolve_batch(mints)
+                for t in wallet_analytics.tokens:
+                    if t.mint in resolved:
+                        t.symbol = resolved[t.mint][0]
+
+        # 4. Cache result
+        cache.put(wallet, wallet_analytics)
+
+        # 4.5. Log scan to analytics collector
+        total_time = round(time.time() - start, 2)
+        if collector:
+            collector.log_scan(
+                wallet=wallet,
+                score=wallet_analytics.score,
+                win_rate=wallet_analytics.win_rate,
+                pnl_sol=wallet_analytics.total_realized_pnl_sol,
+                strategy=wallet_analytics.strategy,
+                total_trades=wallet_analytics.total_trades,
+                unique_tokens=wallet_analytics.unique_tokens,
+                scan_time=total_time,
+            )
+
+        # 5. Build response
+        response = cache.get(wallet)
+        response["_cached"] = False
+        response["_scan_info"] = {
+            "signatures_found": fetch_result["signatures_found"],
+            "transactions_fetched": fetch_result["transactions_fetched"],
+            "swaps_detected": len(parse_result.swaps),
+            "transfers_in": parse_result.transfers_in,
+            "transfers_out": parse_result.transfers_out,
+            "account_mgmt": parse_result.account_mgmt,
+            "unknown_tx": parse_result.unknown_tx,
+            "skipped_tx": parse_result.total_skipped,
+            "fetch_time": fetch_result["fetch_time_seconds"],
+            "total_time": total_time,
+        }
+
+        return response
+
+    finally:
+        if _scan_semaphore:
+            _scan_semaphore.release()
 
 
 @app.get("/wallet/{address}/summary")
