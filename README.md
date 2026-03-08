@@ -1,109 +1,256 @@
+# WalletIntel v2 — Free Solana Wallet PnL API
+
+[![Live API](https://img.shields.io/badge/API-Live-brightgreen)](https://api.walletintel.dev/docs)
+[![Website](https://img.shields.io/badge/Website-walletintel.dev-blue)](https://walletintel.dev)
+[![Telegram](https://img.shields.io/badge/Telegram-@walletintel__daily-blue)](https://t.me/walletintel_daily)
+[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+
+**Analyze any Solana wallet in seconds — PnL, Win Rate, Strategy Detection, Score.** Free, open-source, no API key required.
+
+🔗 **Live:** [walletintel.dev](https://walletintel.dev) | **API Docs:** [walletintel.dev/docs](https://walletintel.dev/docs) | **Telegram:** [@walletintel_daily](https://t.me/walletintel_daily)
+
 ---
-datasets:
-- bigcode/starcoderdata
-language:
-- code
-tags:
-- causal-lm
-model-index:
-  - name: stabilityai/stablecode-completion-alpha-3b-4k
-    results:
-      - task:
-          type: text-generation
-        dataset:
-          type: openai_humaneval
-          name: HumanEval
-        metrics:
-          - name: pass@1
-            type: pass@1
-            value: 0.1768
-            verified: false
-          - name: pass@10
-            type: pass@10
-            value: 0.2701
-            verified: false
 
-license: apache-2.0
----
-# `StableCode-Completion-Alpha-3B-4K`
+## What is WalletIntel?
 
-## Model Description
+WalletIntel is a **free Solana wallet analyzer API** that provides:
 
-`StableCode-Completion-Alpha-3B-4K` is a 3 billion parameter decoder-only code completion model pre-trained on diverse set of programming languages that topped the stackoverflow developer survey. 
+- **PnL per token** — Realized profit/loss for every token traded (FIFO cost basis)
+- **Win Rate** — Percentage of profitable trades (closed positions only)
+- **Strategy Detection** — Sniper, Scalper, Smart Money, Diamond Hands, Degen
+- **Wallet Score** — 0-100 rating based on profitability, consistency, and volume
+- **Token Resolution** — Auto-resolved symbols via DexScreener
+- **DEX Detection** — Jupiter, Raydium, pump.fun, Orca, Meteora
 
-## Usage
-The model is intended to do single/multiline code completion from a long context window upto 4k tokens.
-Get started generating code with `StableCode-Completion-Alpha-3B-4k` by using the following code snippet:
+Built for developers building **Solana trading bots**, **copy-trade systems**, **wallet trackers**, and **DeFi analytics dashboards**.
+
+## Quick Start
+
+**No signup. No API key. One HTTP request.**
+
+### cURL
+
+```bash
+# Full PnL analysis
+curl https://api.walletintel.dev/wallet/YOUR_WALLET_ADDRESS/pnl
+
+# Quick summary (no per-token breakdown)
+curl https://api.walletintel.dev/wallet/YOUR_WALLET_ADDRESS/summary
+
+# Top wallets leaderboard
+curl https://api.walletintel.dev/leaderboard?sort=score
+```
+
+### Python
 
 ```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-tokenizer = AutoTokenizer.from_pretrained("stabilityai/stablecode-completion-alpha-3b-4k")
-model = AutoModelForCausalLM.from_pretrained(
-  "stabilityai/stablecode-completion-alpha-3b-4k",
-  trust_remote_code=True,
-  torch_dtype="auto",
-)
-model.cuda()
-inputs = tokenizer("import torch\nimport torch.nn as nn", return_tensors="pt").to("cuda")
-tokens = model.generate(
-  **inputs,
-  max_new_tokens=48,
-  temperature=0.2,
-  do_sample=True,
-)
-print(tokenizer.decode(tokens[0], skip_special_tokens=True))
+import requests
+
+wallet = "CshCAkxi4JZktyHr8Co9DwfJjrt2mFGxewMSYHQtrJMq"
+resp = requests.get(f"https://api.walletintel.dev/wallet/{wallet}/pnl")
+data = resp.json()
+
+print(f"PnL: {data['total_realized_pnl_sol']} SOL")
+print(f"Win Rate: {data['win_rate']}%")
+print(f"Strategy: {data['strategy']}")
+print(f"Score: {data['score']}/100")
+print(f"Tokens traded: {data['unique_tokens']}")
+
+# Per-token breakdown
+for token in data['tokens'][:5]:
+    symbol = token['symbol'] or token['mint'][:12]
+    print(f"  {symbol}: {token['realized_pnl_sol']:+.4f} SOL")
 ```
 
-## Model Details
+### JavaScript
 
-* **Developed by**: [Stability AI](https://stability.ai/)
-* **Model type**: `StableCode-Completion-Alpha-3B-4k` models are auto-regressive language models based on the transformer decoder architecture.
-* **Language(s)**: Code
-* **Library**: [GPT-NeoX](https://github.com/EleutherAI/gpt-neox)
-* **License**: Model checkpoints are licensed under the [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) license.
-* **Contact**: For questions and comments about the model, please email `lm@stability.ai`
+```javascript
+const wallet = "CshCAkxi4JZktyHr8Co9DwfJjrt2mFGxewMSYHQtrJMq";
+const resp = await fetch(
+  `https://api.walletintel.dev/wallet/${wallet}/pnl`
+);
+const data = await resp.json();
 
-### Model Architecture
+console.log(`Score: ${data.score}/100`);
+console.log(`PnL: ${data.total_realized_pnl_sol} SOL`);
+console.log(`Strategy: ${data.strategy}`);
+```
 
-| Parameters     | Hidden Size | Layers | Heads | Sequence Length |
-|----------------|-------------|--------|-------|-----------------|
-| 2,796,431,360  | 2560        | 32     | 32    | 4096            |
+### Telegram Bot Example
 
+```python
+import requests
+import telebot
 
-* **Decoder Layer**: Parallel Attention and MLP residuals with a single input LayerNorm ([Wang & Komatsuzaki, 2021](https://github.com/kingoflolz/mesh-transformer-jax/tree/master))
-* **Position Embeddings**: Rotary Position Embeddings ([Su et al., 2021](https://arxiv.org/abs/2104.09864))
-* **Bias**: LayerNorm bias terms only
+bot = telebot.TeleBot("YOUR_BOT_TOKEN")
 
-## Training
+@bot.message_handler(commands=['scan'])
+def scan_wallet(message):
+    wallet = message.text.split(' ')[1]
+    resp = requests.get(
+        f"https://api.walletintel.dev/wallet/{wallet}/summary"
+    )
+    data = resp.json()
 
-`StableCode-Completion-Alpha-3B-4k` is pre-trained at a context length of 4096 for 300 billion tokens on the `bigcode/starcoder-data`.
+    bot.reply_to(message,
+        f"🔍 Wallet: {wallet[:8]}...{wallet[-4:]}\n"
+        f"📊 Score: {data['score']}/100\n"
+        f"🎯 Win Rate: {data['win_rate']}%\n"
+        f"💰 PnL: {data['total_realized_pnl_sol']:+.2f} SOL\n"
+        f"🧠 Strategy: {data['strategy']}"
+    )
+```
 
-### Training Dataset
+## API Endpoints
 
-The first pre-training stage relies on 300B tokens sourced from various top programming languages occuring in the stackoverflow developer survey present in the `starcoder-data` dataset. 
+| Endpoint | Description |
+|---|---|
+| `GET /wallet/{address}/pnl` | Full PnL analysis with per-token breakdown |
+| `GET /wallet/{address}/summary` | Quick summary without token details |
+| `GET /leaderboard` | Top wallets by score, PnL, win rate |
+| `GET /health` | Service health check |
+| `GET /stats` | Usage statistics |
+| `GET /docs` | Interactive Swagger documentation |
 
-### Training Procedure
+### Parameters
 
-The model is pre-trained on the dataset mixes mentioned above in mixed-precision BF16), optimized with AdamW, and trained using the [StarCoder](https://huggingface.co/bigcode/starcoder) tokenizer with a vocabulary size of 49k.
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `max_tx` | 1000 | 10-5000 | Max transactions to scan |
+| `force_refresh` | false | - | Skip cache, rescan wallet |
 
-* **Software**: We use a fork of gpt-neox ([EleutherAI, 2021](https://github.com/EleutherAI/gpt-neox)) and train under 2D parallelism (Data and Tensor Parallel) with ZeRO-1 ([Rajbhandari et al., 2019](https://arxiv.org/abs/1910.02054v3)) and rely on flash-attention as well as rotary embedding kernels from FlashAttention-2 ([Dao et al., 2023](https://tridao.me/publications/flash2/flash2.pdf))
+### Example Response
 
-## Use and Limitations
-
-### Intended Use
-
-StableCode-Completion-Alpha-3B-4K independently generates new code completions, but we recommend that you use StableCode-Completion-Alpha-3B-4K together with the tool developed by BigCode and HuggingFace [(huggingface/huggingface-vscode: Code completion VSCode extension for OSS models (github.com))](https://github.com/huggingface/huggingface-vscode), to identify and, if necessary, attribute any outputs that match training code.
-
-### Limitations and bias
-
-This model is intended to be used responsibly. It is not intended to be used to create unlawful content of any kind, to further any unlawful activity, or to engage in activities with a high risk of physical or economic harm.
-
-## How to cite
-
-```bibtex
-@misc{StableCodeCompleteAlpha4K, 
-      url={[https://huggingface.co/stabilityai/stablecode-complete-alpha-3b-4k](https://huggingface.co/stabilityai/stablecode-complete-alpha-3b-4k)}, 
-      title={Stable Code Complete Alpha}, 
-      author={Adithyan, Reshinth and Phung, Duy and Cooper, Nathan and Pinnaparaju, Nikhil and Laforte, Christian}
+```json
+{
+  "wallet": "CshCAkxi4JZktyHr8Co9DwfJjrt2mFGxewMSYHQtrJMq",
+  "total_trades": 60,
+  "total_buys": 30,
+  "total_sells": 30,
+  "unique_tokens": 31,
+  "total_realized_pnl_sol": 8.637,
+  "win_rate": 43.3,
+  "strategy": "mixed",
+  "score": 64,
+  "dex_usage": {
+    "pumpfun": 59,
+    "unknown": 1
+  },
+  "active_days": 39,
+  "tokens": [
+    {
+      "mint": "cXcoMLKQReV9osApm5KU6GLHie8tGAz1Gy9MpBapump",
+      "symbol": "ZOOFIGHTER",
+      "buys": 1,
+      "sells": 1,
+      "total_sol_spent": 0.833,
+      "total_sol_received": 2.283,
+      "realized_pnl_sol": 1.45,
+      "is_closed": true,
+      "hold_time_seconds": 49
+    }
+  ]
 }
 ```
+
+## Use Cases
+
+### 🤖 Copy-Trade Bot
+Scan wallets from the leaderboard, filter by score > 80 and win rate > 70%, then monitor their new trades.
+
+### 🔔 Smart Money Alerts
+Periodically rescan top wallets — when PnL changes, a whale made a new trade. Send Telegram/Discord alerts.
+
+### 📊 Analytics Dashboard
+Embed wallet intelligence into your own DeFi dashboard. Show users their PnL, strategy, and score.
+
+### 🎯 Wallet Filtering
+Before following a wallet, check if it's actually profitable. Filter out bots, scammers, and random wallets.
+
+## Architecture
+
+```
+Client → nginx (HTTPS) → FastAPI :8000 → RPC Pool → Solana RPC
+                                        → TX Parser (preTokenBalances diff)
+                                        → Analytics Engine (PnL/WR/Strategy/Score)
+                                        → Token Resolver (DexScreener)
+                                        → In-memory Cache (24h TTL)
+                                        → SQLite Analytics Collector
+```
+
+**Key technical decisions:**
+- **No Helius dependency** — uses free Alchemy RPC + public Solana fallback
+- **100% transaction fetch rate** — 2-pass retry with concurrent + sequential fallback
+- **FIFO cost basis** — accurate PnL for partial sells and multiple buys
+- **preTokenBalances diff** — handles WSOL wrapping, token creation in same tx
+- **Max 3 concurrent scans** — semaphore prevents server overload
+
+## Performance
+
+| Metric | Value |
+|---|---|
+| Fetch rate | 100% (zero lost transactions) |
+| Scan time (500 tx) | ~15-30 seconds |
+| Scan time (1000 tx) | ~30-60 seconds |
+| Cached response | < 50ms |
+| Throughput (cached) | 300+ req/sec |
+| Concurrent scans | 3 simultaneous |
+
+## Leaderboard
+
+Community-powered wallet database. Every scan adds to the leaderboard.
+
+```bash
+# Top wallets by score
+curl https://api.walletintel.dev/leaderboard?sort=score&limit=10
+
+# Top by PnL
+curl https://api.walletintel.dev/leaderboard?sort=pnl
+
+# Top by win rate
+curl https://api.walletintel.dev/leaderboard?sort=win_rate
+
+# Most scanned
+curl https://api.walletintel.dev/leaderboard?sort=popular
+```
+
+## Limits
+
+| | Free Tier |
+|---|---|
+| Price | $0 |
+| Requests/day | 10 |
+| Max transactions | 5,000 |
+| Cache TTL | 24 hours |
+| API key required | No |
+
+**Note:** PnL is calculated in SOL, not USD. Default scan depth is 1,000 transactions — use `max_tx=5000` for full history.
+
+## Self-Hosting
+
+```bash
+git clone https://github.com/ace8ecar-source/walletintel-v2.git
+cd walletintel-v2
+pip install -r requirements.txt
+
+# Add your RPC provider
+cp .env.example .env
+# Edit .env with your Alchemy/other RPC key
+
+python run.py
+# API available at http://localhost:8000
+```
+
+## Support
+
+- **Telegram:** [@walletintel_daily](https://t.me/walletintel_daily) — daily leaderboard reports
+- **GitHub Issues:** [Report bugs & request features](https://github.com/ace8ecar-source/walletintel-v2/issues)
+- **Donate:** `ykq4M8KYzbrJ9dwG9mAcRuQope1arSWVJzyDRJX4MFj` (any Solana token accepted)
+
+## Keywords
+
+Solana wallet analyzer, Solana PnL API, Solana wallet PnL, free Solana API, Solana win rate, Solana trading bot API, Solana copy trade, Solana smart money, Solana wallet score, pump.fun wallet analyzer, Solana DeFi analytics, Solana wallet tracker, Solana trading analytics, Solana wallet intelligence
+
+---
+
+**Built with ⚡ on Solana** | [walletintel.dev](https://walletintel.dev)
