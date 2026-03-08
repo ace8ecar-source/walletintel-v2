@@ -231,7 +231,7 @@ footer a { color: var(--accent); text-decoration: none; }
 
 <!-- Notices -->
 <section class="notices">
-  <div class="notice-grid">
+  <div class="notice-grid"><div class="notice notice-warn"><div class="icon">&#9888;</div><div><div class="label">Default scan depth</div><div class="value">1,000 tx · increase via max_tx param (up to 5,000)</div></div></div>
     <div class="notice">
       <div class="icon">&#128202;</div>
       <div><div class="label">Max scan depth</div><div class="value">5,000 transactions</div></div>
@@ -338,6 +338,7 @@ console.<span class="func">log</span>(<span class="string">`Score: <span class="
 
 <!-- Leaderboard -->
 <section class="leaderboard" id="leaderboard">
+  <div class="notice notice-warn" style="margin-bottom:24px"><div class="icon">&#9888;</div><div><div class="label">Important</div><div class="value">Leaderboard data is based on default scan of 1,000 transactions. For full accuracy, use max_tx=5000 via API.</div></div></div>
   <h2 class="section-title">&#127942; Leaderboard</h2>
   <p class="section-sub">Top wallets discovered by the community. Scan more wallets to grow the database.</p>
   <div class="lb-tabs">
@@ -471,7 +472,7 @@ async function loadLeaderboard(sort, el) {
       const sign = w.pnl_sol >= 0 ? '+' : '';
       html += `<tr>
         <td>${i+1}</td>
-        <td><a class="lb-wallet" href="${API}/wallet/${w.wallet}/pnl" target="_blank">${w.wallet.slice(0,6)}...${w.wallet.slice(-4)}</a></td>
+        <td><a class="lb-wallet" href="https://api.walletintel.dev/wallet/${w.wallet}/pnl" target="_blank">${w.wallet.slice(0,6)}...${w.wallet.slice(-4)}</a></td>
         <td><span class="lb-score ${sc}">${w.score}</span></td>
         <td>${w.win_rate}%</td>
         <td><span class="lb-pnl ${pc}">${sign}${w.pnl_sol.toFixed(2)}</span></td>
